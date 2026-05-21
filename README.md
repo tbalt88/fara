@@ -2,6 +2,8 @@
 
 # Fara-7B: An Efficient Agentic Model for Computer Use
 
+
+
 <img src="figures/model_accuracy_vs_cost_v2_glm_cost_updated.png" alt="Fara-7B Performance" width="600"/>
 
 [![Microsoft](https://img.shields.io/badge/Microsoft-Project-0078D4?logo=microsoft)](https://aka.ms/msaif/fara)
@@ -17,6 +19,7 @@
 
 ## Updates
 
+* **2026-05-21** - Fara 1.5 agent harness coming soon!
 * **2026-05-12** — Refreshed **WebTailBench (V2)** tasks and rubrics.
   Many V1 tasks had calendar-bound dates that expired (Nov 2025); V2
   rolls those forward and revises the precomputed rubrics for the
