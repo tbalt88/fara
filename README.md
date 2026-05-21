@@ -19,7 +19,7 @@
 
 ## Updates
 
-* **2026-05-21** - Fara 1.5 agent harness coming soon!
+* **2026-05-21** - Fara1.5 agent harness coming soon!
 * **2026-05-12** — Refreshed **WebTailBench (V2)** tasks and rubrics.
   Many V1 tasks had calendar-bound dates that expired (Nov 2025); V2
   rolls those forward and revises the precomputed rubrics for the
