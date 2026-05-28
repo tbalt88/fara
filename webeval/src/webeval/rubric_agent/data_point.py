@@ -261,6 +261,7 @@ class StepSummary(BaseModel):
     user_messages_before: List[Tuple[UserMessageType, str]] = Field(
         default_factory=list
     )
+    tool_output: str = ""
 
 
 class SolverConfig(Component):
@@ -448,6 +449,12 @@ class SolverLog(Component):
             )
             url = url_obs.url if url_obs else ""
 
+            post_obs = (
+                step.observations_post.main + step.observations_post.next_pre.main
+            )
+            tool_obs = get_observations(post_obs, ToolOutput)
+            tool_output = "\n".join(o.output for o in tool_obs if o.output)
+
             result.append(
                 StepSummary(
                     index=action_idx,
@@ -460,6 +467,7 @@ class SolverLog(Component):
                     previous_error=c.get("other_state", {}).get("previous_error", ""),
                     screenshot_path=screenshot,
                     user_messages_before=user_msgs,
+                    tool_output=tool_output,
                 )
             )
         return result
@@ -529,7 +537,33 @@ class MMRubricOutcomeResult(VerificationResult):
     result_type: Literal["mm_rubric_outcome"] = "mm_rubric_outcome"
     output_success: Optional[bool] = None
     primary_intent: str = ""
+    # Critical-point fields populated by MMRubricAgent's CP classifier
+    # + CP violation check. Default ``None`` keeps the existing serialized
+    # form on disk readable by older consumers.
+    cp_type_used: Optional[str] = None
+    cp_violation: Optional[bool] = None
 
+
+class CriticalPointClassificationResult(VerificationResult):
+    """Task-only critical-point classification produced by the rubric agent.
+
+    Stored on ``data_point.verification`` under the key
+    ``"rubric_critical_point"``.
+    """
+
+    result_type: Literal["rubric_critical_point"] = "rubric_critical_point"
+    critical_point_type: Optional[str] = None
+    classification_reasoning: str = ""
+    irreversible_action_present: Optional[bool] = None
+    irreversible_action_description: str = ""
+    missing_user_information: List[str] = Field(default_factory=list)
+    underspecified_aspects: List[str] = Field(default_factory=list)
+    expected_behavior: List[str] = Field(default_factory=list)
+    confidence: Optional[str] = None
+    # Whether `ask_user_question` was available at solve time, as
+    # interpreted by the rubric. Affects how `expected_behavior` is
+    # phrased and how downstream prompts read this record.
+    user_simulator_enabled: bool = False
 
 
 class TaskAgentResult(VerificationResult):
@@ -556,6 +590,7 @@ VerificationResultEvent = Annotated[
     Union[
         MMRubricResult,
         MMRubricOutcomeResult,
+        CriticalPointClassificationResult,
         WebJudgeResult,
         TaskAgentResult,
         VerificationResult,

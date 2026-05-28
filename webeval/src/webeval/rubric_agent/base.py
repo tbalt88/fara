@@ -1,9 +1,11 @@
-"""Minimal Agent / VerifierAgent / AgentConfig base classes.
+"""Minimal Agent / AgentConfig base classes.
 
 Only the config-plumbing surface needed by
-:class:`.mm_rubric_agent.MMRubricAgent` in evaluation mode
-(``_extract_input_from_datapoint`` + ``_generate_reply`` +
-``_wrap_result``) is kept. No RunContext / Environment is instantiated.
+:class:`.mm_rubric_agent.MMRubricAgent` (and the sibling
+:class:`.verifier_agent.VerifierAgent`,
+:class:`.task_classification.TaskAgent`,
+:class:`.critical_point_classifier.CriticalPointAgent`) in evaluation
+mode is kept. No RunContext / Environment is instantiated.
 """
 
 from __future__ import annotations
@@ -48,10 +50,6 @@ class Agent(ABC):
     @property
     def client(self) -> Any:
         return self.config.client
-
-
-class VerifierAgent(Agent):
-    """Marker base for verification agents."""
 
 
 class RunContext:  # noqa: D401 — stub for type-hint compatibility

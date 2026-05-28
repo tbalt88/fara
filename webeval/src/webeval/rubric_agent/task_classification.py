@@ -1,37 +1,13 @@
-"""
-Task Classification — Unified Verification Check (Step 10)
-===========================================================
+"""Task Classification — Unified Verification Check (Step 10).
 
 Standalone module for classifying tasks before execution.  The unified
-:func:`classify_task` function replaces the former two-step approach
-(Step 10a: ambiguous, Step 10b: impossible) with a single LLM call that
-evaluates **two axes** drawn from the error taxonomy:
+:func:`classify_task` function classifies the task along two axes:
 
-  1. **Task Ambiguity** (Category 7)  — underspecified, ambiguous, unsafe
-  2. **Invalid Task**   (Category 8)  — impossible, illegal, NSFW, RAI
+  1. **Task Ambiguity** (Category 7)
+  2. **Invalid Task**   (Category 8)
 
 Only the task description, starting URL/app, and current date are
 required — no screenshots, action history, or rubric context.
-
-Usage
------
-Via :class:`TaskAgent` (recommended)::
-
-    from webeval.rubric_agent.task_classification import (
-        TaskAgent, TaskAgentConfig,
-    )
-
-    agent = TaskAgent(TaskAgentConfig(client=my_llm_client))
-    # Standalone (no DataPoint):
-    result = await agent.classify("Book a flight", "https://...", apps=["Google Flights"])
-    # With a DataPoint via RunContext:
-    results = await agent.run(run_context)
-
-Via bare function::
-
-    from webeval.rubric_agent.task_classification import classify_task
-    result = await classify_task("Book a flight", "https://...", client)
-
 """
 
 import json
@@ -42,14 +18,9 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import ConfigDict
 
-from .base import AgentConfig, RunContext, VerifierAgent
+from .base import Agent, AgentConfig, RunContext
 from .data_point import DataPoint, TaskAgentResult
 from .prompts import CHECK_VALID_TASK_PROMPT
-
-# webeval's native ChatCompletionClient interface.
-from webeval.oai_clients import (
-    ChatCompletionClient,  # noqa: F401 — re-exported for type hints only
-)
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +31,6 @@ DEFAULT_SYSTEM_MESSAGES: List[Dict[str, str]] = [
 MAX_LLM_RETRIES = 5
 
 # Required top-level fields and their expected types in the verification JSON.
-# This module validates only axes 1 (ambiguity) and 2 (invalid task), which
-# are the outputs produced by classify_task / CHECK_VALID_TASK_PROMPT.
 _REQUIRED_FIELDS: Dict[str, type] = {
     "reasoning_is_ambiguous": str,
     "is_ambiguous": bool,
@@ -98,19 +67,13 @@ def extract_initial_url(data_point: DataPoint) -> str:
 
 
 def extract_apps(data_point: DataPoint) -> List[str]:
-    """Extract the application name(s) from environment_config.apps.
-
-    Returns a list of application names.  Falls back to ``["Edge"]``
-    (Microsoft Edge) when there is a URL but no explicit app list, or
-    ``["N/A"]`` when there is neither.
-    """
+    """Extract the application name(s) from environment_config.apps."""
     env_cfg = data_point.task.environment_config or {}
     apps = env_cfg.get("apps")
     if apps:
         if isinstance(apps, list):
             return [str(a) for a in apps]
         return [str(apps)]
-    # No explicit apps — default to Edge if there is a URL
     url = extract_initial_url(data_point)
     if url and url != "N/A":
         return ["Edge"]
@@ -130,14 +93,10 @@ def extract_app(data_point: DataPoint) -> str:
 # ---------------------------------------------------------------------------
 async def _call_llm(
     messages: list[dict],
-    client: Any,
+    client: Any,  # ChatCompletionClient
     json_output: bool = False,
 ) -> str:
-    """Call a :class:`ChatCompletionClient` and return the response text.
-
-    ``messages`` is a list of OpenAI-chat-completion dicts that the
-    wrappers in :mod:`webeval.oai_clients.wrapper` accept directly.
-    """
+    """Call an LLM client and return the text content."""
     supports_json = True
     fn = getattr(client, "supports_json", None)
     if callable(fn):
@@ -152,9 +111,7 @@ async def _call_llm(
     content = result.content
     if hasattr(content, "content"):
         content = content.content
-    assert isinstance(content, str), (
-        f"Expected str content from client, got {type(content).__name__}: {content!r}"
-    )
+    assert isinstance(content, str)
     return content
 
 
@@ -168,7 +125,6 @@ def _validate_verification_result(result: dict) -> None:
                 f"{field} must be {expected_type.__name__}, "
                 f"got {type(result[field]).__name__}"
             )
-    # Reasoning fields must be non-empty strings.
     for rf in ("reasoning_is_ambiguous", "reasoning_is_invalid"):
         if not result[rf]:
             raise ValueError(f"{rf} must be a non-empty string")
@@ -186,20 +142,8 @@ class TaskAgentConfig(AgentConfig):
     client: Any = None  # ChatCompletionClient
 
 
-class TaskAgent(VerifierAgent):
-    """Agent that performs task verification classification.
-
-    Evaluates a task along two axes (ambiguity, validity)
-    and returns a :class:`TaskAgentResult`.
-
-    Two usage patterns:
-
-    1. **Via RunContext** (``run``): Reads the task from a DataPoint,
-       extracts the URL from solver_log events, classifies, and returns
-       the result.
-    2. **Standalone** (``classify``): Takes raw task text + URL and
-       returns a result without needing a DataPoint.
-    """
+class TaskAgent(Agent):
+    """Agent that performs task verification classification."""
 
     config: TaskAgentConfig
 
@@ -210,11 +154,6 @@ class TaskAgent(VerifierAgent):
     async def run(
         self, run_context: RunContext, input: Any = None
     ) -> list[TaskAgentResult]:
-        """Classify the task in the DataPoint.
-
-        Returns a single-element list containing the
-        :class:`TaskAgentResult`.
-        """
         dp = run_context.data_point
         task_desc = dp.task.instruction
         url = extract_initial_url(dp)
@@ -251,38 +190,13 @@ class TaskAgent(VerifierAgent):
 async def classify_task(
     task: str,
     url: str,
-    client: ChatCompletionClient,
+    client: Any,  # ChatCompletionClient
     *,
     apps: List[str] | None = None,
     date: str | None = None,
     system_messages: Optional[List[Dict[str, str]]] = None,
 ) -> TaskAgentResult:
-    """Unified task verification classification across ambiguity
-    and validity axes.
-
-    Parameters
-    ----------
-    task : str
-        The task description the agent was asked to complete.
-    url : str
-        The starting URL (or ``"N/A"`` / empty string).
-    client : ChatCompletionClient
-        LLM client to use for the classification call.
-    apps : list[str], optional
-        The application(s) available to the agent (e.g.
-        ``["Google Flights", "Edge"]``).  Defaults to ``["N/A"]``.
-    date : str, optional
-        ISO-formatted date string (e.g. ``"2026-04-07"``).
-        Defaults to today's UTC date.
-    system_messages : list[dict], optional
-        Override the default system messages.
-
-    Returns
-    -------
-    TaskAgentResult
-        Structured result matching the ``CHECK_VALID_TASK_PROMPT`` schema.
-        On repeated LLM failures, boolean fields are set to ``None``.
-    """
+    """Unified task verification classification across ambiguity and validity."""
     if apps is None:
         apps = ["N/A"]
     if date is None:

@@ -39,7 +39,9 @@ dependencies = [
     "mlflow",
     "rpds-py",
     "pillow",
-    "tiktoken"
+    "tiktoken",
+    "imagehash",
+    "jinja2"
 ]
 
 
