@@ -81,7 +81,13 @@ async def llm_call_expect_json(
             if json_output:
                 create_kwargs["json_output"] = True
             result = await client.create(**create_kwargs)
-            response_text = (result.content.content or "").strip()
+            # CreateResult.content is a plain str on the OpenAI/gateway path
+            # but a nested object on some Azure wrappers — unwrap defensively
+            # (mirrors task_classification's helper) so neither shape breaks.
+            content = result.content
+            if hasattr(content, "content"):
+                content = content.content
+            response_text = (content or "").strip()
         except Exception as e:
             # Don't nudge on transport errors — the LLM never saw the
             # prompt, so an "Error: ConnectionError" turn is just noise.
