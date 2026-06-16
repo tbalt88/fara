@@ -60,6 +60,8 @@ from webeval.rubric_agent import (
     MMRubricAgentConfig,
     MMRubricOutcomeResult,
     MMRubricResult,
+    VerifierAgent,
+    VerifierAgentConfig,
 )
 from webeval.trajectory import Trajectory
 
@@ -127,12 +129,13 @@ _TASK_LOADERS = {
 # Globals populated by ``_pool_init`` so each worker only builds its judge
 # clients once, not once per task.
 _GLOBAL_AGENT: Optional[MMRubricAgent] = None
+_GLOBAL_VERIFIER: Optional[VerifierAgent] = None
 _GLOBAL_TASKS: Optional[Dict[str, Dict[str, Any]]] = None
 _GLOBAL_ARGS: Dict[str, Any] = {}
 
 
 def _pool_init(args_dict: Dict[str, Any], tasks: Dict[str, Dict[str, Any]]):
-    global _GLOBAL_AGENT, _GLOBAL_TASKS, _GLOBAL_ARGS
+    global _GLOBAL_AGENT, _GLOBAL_VERIFIER, _GLOBAL_TASKS, _GLOBAL_ARGS
     _GLOBAL_TASKS = tasks
     _GLOBAL_ARGS = args_dict
 
@@ -155,6 +158,13 @@ def _pool_init(args_dict: Dict[str, Any], tasks: Dict[str, Dict[str, Any]]):
             majority_vote_instances=args_dict["majority_vote_instances"],
             redo_eval=args_dict["redo_eval"],
             rubric_score_threshold=args_dict["rubric_threshold"],
+            action_definitions=FARA_ACTION_DEFINITIONS,
+        )
+    )
+    _GLOBAL_VERIFIER = VerifierAgent(
+        config=VerifierAgentConfig(
+            o4mini_client=o4mini_client,
+            gpt5_client=gpt5_client,
             action_definitions=FARA_ACTION_DEFINITIONS,
         )
     )
@@ -208,9 +218,26 @@ def _run_one(traj_dir_str: str) -> Dict[str, Any]:
             redo_eval=_GLOBAL_ARGS["redo_eval"],
         )
 
-        result = asyncio.run(_GLOBAL_AGENT._generate_reply(input_dict))
-        if not isinstance(result, dict):
-            raise TypeError(f"Expected dict from MMRubricAgent, got {type(result)}")
+        async def _run_pipeline(inp: Dict[str, Any]) -> Dict[str, Any]:
+            rubric_out = await _GLOBAL_AGENT._generate_reply(inp)
+            if not isinstance(rubric_out, dict):
+                raise TypeError(
+                    f"Expected dict from MMRubricAgent, got {type(rubric_out)}"
+                )
+            if "error" in rubric_out:
+                return rubric_out
+            outcome_block = rubric_out.get("outcome_verification") or {}
+            failure_analysis = await _GLOBAL_VERIFIER.verify(
+                rubric_dict=rubric_out,
+                outcome_dict=outcome_block,
+                input_dict=inp,
+            )
+            rubric_out.setdefault("intermediate_mm_rubric_steps", {}).update(
+                failure_analysis
+            )
+            return rubric_out
+
+        result = asyncio.run(_run_pipeline(input_dict))
         if "error" in result:
             raise RuntimeError(f"Rubric agent reported error: {result.get('error')}")
 
@@ -254,6 +281,8 @@ def _run_one(traj_dir_str: str) -> Dict[str, Any]:
                 "outcome_primary_intent": outcome_vr.primary_intent,
                 "rubric_total_max_points": rubric_vr.total_max_points,
                 "rubric_total_earned_points": rubric_vr.total_earned_points,
+                "cp_type_used": outcome_vr.cp_type_used,
+                "cp_violation": outcome_vr.cp_violation,
                 "error_taxonomy": error_taxonomy,
             }
         )

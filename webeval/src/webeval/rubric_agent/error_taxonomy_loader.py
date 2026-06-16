@@ -137,6 +137,54 @@ def extract_summary_table(start: int, end: int) -> str:
     return _summary_table_rows_for_categories(full_table, start, end)
 
 
+# ── Sub-category filtering ───────────────────────────────────────────────────
+
+
+def _filter_excluded_subcategories(text: str, exclude_codes: frozenset[str]) -> str:
+    """Remove ``- **N.M …**`` bullet lines whose code is in *exclude_codes*.
+
+    Each bullet may span multiple lines (the definition wraps). We detect
+    the start of a bullet with ``^- \\*\\*\\d+\\.\\d+`` and consume until
+    the next bullet or a blank/non-continuation line.
+    """
+    if not exclude_codes:
+        return text
+
+    # Build a pattern matching the excluded code prefixes (e.g. "6.4")
+    escaped = [re.escape(c) for c in exclude_codes]
+    exclude_re = re.compile(
+        r"^- \*\*(?:" + "|".join(escaped) + r")\s",
+    )
+    bullet_start_re = re.compile(r"^- \*\*\d+\.\d+")
+
+    lines = text.split("\n")
+    kept: list[str] = []
+    skipping = False
+    for line in lines:
+        if bullet_start_re.match(line):
+            skipping = bool(exclude_re.match(line))
+        if not skipping:
+            kept.append(line)
+    return "\n".join(kept)
+
+
+def _filter_excluded_summary_rows(
+    table_text: str, exclude_codes: frozenset[str]
+) -> str:
+    """Remove summary-table rows whose error code is in *exclude_codes*."""
+    if not exclude_codes:
+        return table_text
+
+    lines = table_text.splitlines()
+    kept: list[str] = []
+    for line in lines:
+        m = re.match(r"\|\s*(\d+\.\d+)\s*\|", line)
+        if m and m.group(1) in exclude_codes:
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def _postprocess_category_6_for_prompt(text: str) -> str:
     """Replace the static action-space list in category 6 with Template vars.
 
@@ -216,6 +264,28 @@ def get_taxonomy_for_task_classification() -> str:
     return escape_for_template(cats_text)
 
 
+def extract_category_blockquotes(category_num: int) -> str:
+    """Return all blockquote content (``> ...`` lines) from a single category.
+
+    Useful for nuance notes and clarifications that appear after the
+    sub-category bullet definitions (e.g., ``> **Nuances of 6.4 …**``).
+    The ``> `` prefix is stripped.  Returns raw markdown (NOT
+    Template-escaped).
+    """
+    md = _load_raw_md()
+    cats = _split_into_categories(md)
+    if category_num not in cats:
+        return ""
+    text = cats[category_num]
+    blockquote_lines: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("> "):
+            blockquote_lines.append(line[2:])
+        elif line.strip() == ">":
+            blockquote_lines.append("")
+    return "\n".join(blockquote_lines).strip()
+
+
 def extract_subcategory_bullets(category_num: int) -> str:
     """Return only the ``- **N.M …**`` bullet lines for a single category.
 
@@ -233,3 +303,138 @@ def extract_subcategory_bullets(category_num: int) -> str:
         if re.match(r"^- \*\*\d+\.\d+", line):
             bullets.append(line)
     return "\n".join(bullets)
+
+
+# Regex matching a subcategory bullet: ``- **N.M Name** — Definition...``
+# Optional third numeric segment (``N.M.K``) is supported for sub-sub-categories
+# (e.g. ``3.2.1``).
+_SUBCATEGORY_BULLET_RE = re.compile(
+    r"^- \*\*(\d+\.\d+(?:\.\d+)?)\s+(.+?)\*\*\s*[—–-]\s*(.+)",
+)
+
+
+@lru_cache(maxsize=None)
+def extract_subcategory(code: str) -> tuple[str, str]:
+    """Return ``(name, definition)`` for a single subcategory code like ``'6.3'``.
+
+    Parses the ``- **N.M Name** — Definition...`` bullet from the taxonomy
+    markdown.  Returns the name (e.g. ``'Intent-action mismatch'``) and the
+    full definition text after the em-dash.  Multi-line bullets are joined.
+
+    Raw markdown, NOT Template-escaped.
+
+    Raises ``ValueError`` if *code* is not found.
+    """
+    cat_num = int(code.split(".")[0])
+    md = _load_raw_md()
+    cats = _split_into_categories(md)
+    if cat_num not in cats:
+        raise ValueError(f"Category {cat_num} not found in taxonomy .md")
+
+    text = cats[cat_num]
+    bullet_start_re = re.compile(r"^- \*\*\d+\.\d+")
+    target_re = re.compile(
+        r"^- \*\*" + re.escape(code) + r"\s+(.+?)\*\*\s*[—–-]\s*(.+)",
+    )
+
+    lines = text.splitlines()
+    name: str | None = None
+    definition_parts: list[str] = []
+    collecting = False
+
+    for line in lines:
+        if bullet_start_re.match(line):
+            if collecting:
+                break  # hit next bullet, stop collecting
+            m = target_re.match(line)
+            if m:
+                name = m.group(1)
+                definition_parts.append(m.group(2))
+                collecting = True
+        elif collecting:
+            stripped = line.strip()
+            if stripped:
+                definition_parts.append(stripped)
+            else:
+                break  # blank line ends the bullet
+
+    if name is None:
+        raise ValueError(f"Subcategory {code} not found in taxonomy .md")
+
+    return name, " ".join(definition_parts)
+
+
+# ── Harness analysis codes (category 9, fine-grained grounding only) ─────
+
+# Hard-coded metadata for 9.x codes.  These are intentionally NOT included
+# in the main taxonomy helpers (``get_taxonomy_for_failure_prompt``, etc.)
+# so they never leak into the Step 9a failure-points prompt.  The
+# definitions live in ``error_taxonomy_analysis.md`` § 9 for documentation
+# purposes; the code below is the single runtime source of truth consumed
+# by ``_detect_fine_grained_grounding_errors``.
+
+_HARNESS_CODE_INFO: dict[str, dict[str, str]] = {
+    "9.1": {
+        "harness_label": "Harness + Grounding Error",
+        "description": (
+            "The 6.4 grounding error persists when evaluated against the "
+            "previous screenshot — the agent saw the same visual context "
+            "and still missed the target."
+        ),
+    },
+    "9.2": {
+        "harness_label": "Harness only",
+        "description": (
+            "The 6.4 grounding error disappears when evaluated against "
+            "the previous screenshot — the error was a harness artifact "
+            "caused by screenshot timing differences."
+        ),
+    },
+}
+
+
+def get_harness_code_info(code: str) -> dict[str, str]:
+    """Return metadata for a harness analysis code (9.1 or 9.2).
+
+    Used exclusively by ``_detect_fine_grained_grounding_errors``.
+    Raises ``KeyError`` if *code* is not a valid harness code.
+    """
+    return _HARNESS_CODE_INFO[code]
+
+
+# ── All-codes accessor (for dashboards / aggregation tooling) ────────────────
+
+
+@lru_cache(maxsize=1)
+def get_all_error_codes() -> dict[str, str]:
+    """Return an ordered mapping of every error code → display name.
+
+    Walks every top-level category in ``error_taxonomy_analysis.md`` and
+    extracts every bullet matching ``- **N.M Name** —`` or
+    ``- **N.M.K Name** —``.  Includes both the main classification
+    taxonomy (categories 1–8) **and** the harness analysis codes
+    (category 9, which are emitted by ``_detect_fine_grained_grounding_errors``
+    and surfaced in dashboards).
+
+    The returned dict preserves the order in which codes appear in the
+    markdown file.  It is cached and **must not be mutated** by callers
+    (copy first if mutation is needed).
+
+    This is the canonical source of "all valid error codes" for any
+    aggregation, display, or filtering tooling — prefer it over hardcoded
+    lists, which silently rot when the taxonomy is updated.
+
+    Note: ``get_taxonomy_for_failure_prompt`` and
+    ``get_taxonomy_for_task_classification`` deliberately scope themselves
+    to a subset of categories for prompt rendering; this helper has no
+    such restriction.
+    """
+    md = _load_raw_md()
+    cats = _split_into_categories(md)
+    codes: dict[str, str] = {}
+    for cat_num in sorted(cats.keys()):
+        for line in cats[cat_num].splitlines():
+            m = _SUBCATEGORY_BULLET_RE.match(line)
+            if m:
+                codes[m.group(1)] = m.group(2).strip()
+    return codes

@@ -14,10 +14,13 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
+import openai
 import pytest
 from PIL import Image as PILImage
 
@@ -128,6 +131,106 @@ def test_should_include_model_exact_match():
     assert GracefulRetryClient._should_include_model("o4-mini", ["gpt-4o", "o4-mini"])
     assert not GracefulRetryClient._should_include_model("gpt-4o", "o4-mini")
     assert not GracefulRetryClient._should_include_model("gpt-4o-mini", "gpt-4o")
+
+
+class _AlwaysFailsClient:
+    """Fake ChatCompletionClient whose create() always raises ``exc``.
+
+    Exposes the minimal surface GracefulRetryClient.create() touches:
+    ``endpoint``/``description``/``count_tokens``/``create`` (+ an optional
+    ``refresh_credentials`` no-op). Records how many times create() ran so the
+    test can assert the loop is bounded.
+    """
+
+    def __init__(self, exc: Exception, endpoint: str = "https://fake"):
+        self._exc = exc
+        self.endpoint = endpoint
+        self.description = f"fake-gpt-4o@{endpoint}"
+        self.calls = 0
+
+    def count_tokens(self, messages=()):  # noqa: ARG002
+        return 0
+
+    def refresh_credentials(self):
+        pass
+
+    async def create(self, *args, **kwargs):  # noqa: ARG002
+        self.calls += 1
+        raise self._exc
+
+    async def close(self):
+        pass
+
+
+@pytest.mark.parametrize("n_endpoints", [1, 3])
+def test_graceful_retry_terminates_on_persistent_auth_error(n_endpoints):
+    """Regression: a pool that only ever raises AuthenticationError must make
+    create() *terminate* (raising the last error), not spin forever.
+
+    Pre-fix, the AuthenticationError branch neither blocklisted nor consumed
+    the retry budget, so a single bad endpoint wedged create() indefinitely
+    (the 19h hang). The per-error budget + global ``max_total_attempts`` cap
+    now guarantee a bounded number of underlying create() calls.
+    """
+    from webeval.oai_clients import GracefulRetryClient
+
+    auth_err = openai.AuthenticationError(
+        "bad creds",
+        response=httpx.Response(401, request=httpx.Request("POST", "https://fake")),
+        body=None,
+    )
+    clients = [
+        _AlwaysFailsClient(auth_err, endpoint=f"https://fake-{i}")
+        for i in range(n_endpoints)
+    ]
+    g = GracefulRetryClient(
+        clients=clients,
+        logger=logging.getLogger(__name__),
+        max_retries=3,
+    )
+
+    async def _run():
+        # Hard timeout so a regression to the old behaviour fails loudly
+        # instead of hanging the whole suite.
+        return await asyncio.wait_for(g.create(messages=[]), timeout=30)
+
+    with pytest.raises(openai.AuthenticationError):
+        asyncio.run(_run())
+
+    total_calls = sum(c.calls for c in clients)
+    assert total_calls <= g.max_total_attempts
+    # Budget-bounded: max_retries decrements drive termination here.
+    assert total_calls <= g.max_retries + 1
+
+
+def test_graceful_retry_terminates_when_all_endpoints_blocklisted():
+    """A pool that only raises NotFoundError must terminate once every
+    endpoint is blocklisted (next_client() raises), never looping forever."""
+    from webeval.oai_clients import GracefulRetryClient
+
+    not_found = openai.NotFoundError(
+        "no such deployment",
+        response=httpx.Response(404, request=httpx.Request("POST", "https://fake")),
+        body=None,
+    )
+    clients = [
+        _AlwaysFailsClient(not_found, endpoint=f"https://fake-{i}") for i in range(3)
+    ]
+    g = GracefulRetryClient(
+        clients=clients,
+        logger=logging.getLogger(__name__),
+        max_retries=8,
+    )
+
+    async def _run():
+        return await asyncio.wait_for(g.create(messages=[]), timeout=30)
+
+    # All endpoints get blocklisted → next_client() raises RuntimeError.
+    with pytest.raises(RuntimeError):
+        asyncio.run(_run())
+    # One create() per endpoint at most before the pool is exhausted.
+    assert sum(c.calls for c in clients) <= len(clients)
+    assert len(g.blocklist) == len(clients)
 
 
 def test_openai_wrapper_create_round_trip(monkeypatch):

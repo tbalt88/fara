@@ -126,17 +126,26 @@ def test_load_webtailbench_tasks_parses_rubric(tmp_path: Path, verify_mod):
 # End-to-end _run_one against the example trajectory (no LLM)
 # ---------------------------------------------------------------------------
 
-class _StubAgent:
-    """Minimal stand-in for ``MMRubricAgent`` used by ``_run_one``.
+class _StubMMRubricAgent:
+    """Minimal stand-in for ``MMRubricAgent`` (Steps 0–8).
 
-    Returns a fixed rubric+outcome verdict so we can exercise the full
-    data-prep pipeline (Trajectory → DataPoint → input_dict) and the
-    score-file writer without hitting an LLM.
+    Returns a fixed rubric + outcome verdict (with the new
+    CP-classification fields populated) so we can exercise the
+    data-prep pipeline (Trajectory → DataPoint → input_dict), the
+    rubric + outcome wrap path, AND the new CP fields on
+    ``MMRubricOutcomeResult`` without hitting an LLM.
+
+    Steps 9a / 9b / 10 are owned by ``_StubVerifierAgent`` — see
+    ``_run_pipeline`` inside the script for how the two stubs are
+    composed.
     """
 
     async def _generate_reply(self, input_dict: Dict[str, Any]) -> Dict[str, Any]:
         # Record the input so the test can assert on it.
         self.last_input = input_dict
+        # Step 4 evidence is what VerifierAgent.verify() reads when the
+        # caller doesn't pass evidence_by_criterion explicitly — keep one
+        # entry so the stub round-trips realistically.
         return {
             "items": [{"criterion": "stubbed", "earned_points": 1, "max_points": 1}],
             "total_max_points": 1,
@@ -145,23 +154,29 @@ class _StubAgent:
                 "output_success": True,
                 "reasoning": "stubbed",
                 "primary_intent": "stubbed intent",
+                # New CP-aware outcome fields (populated by MMRubricAgent
+                # in Step 8). Stubbed: task is non-critical, no violation.
+                "cp_type_used": "INFORMATION_LOOKUP",
+                "cp_violation": False,
             },
             "intermediate_mm_rubric_steps": {
-                "step9_first_point_of_failure": {
-                    "has_failure": False,
-                    "first_failure_step": None,
+                "step1_num_screenshots": 4,
+                "step4_evidence_by_criterion": {
+                    0: [
+                        {
+                            "screenshot_path": "screenshot_1.png",
+                            "criterion_analysis": "success",
+                            "environment_issues_confirmed": False,
+                        }
+                    ]
                 },
-                "step9b_task_verification_with_trajectory": {
-                    "is_ambiguous": False,
-                    "ambiguity_codes": [],
-                    "is_invalid": False,
-                    "invalid_task_codes": [],
-                },
-                "step10_task_verification": {
-                    "is_ambiguous": False,
-                    "ambiguity_codes": [],
-                    "is_invalid": False,
-                    "invalid_task_codes": [],
+                # Pre-MMRubricAgent CP classification (the new task-only
+                # CP classifier — Step 0c in the refactored agent).
+                "step0_critical_point_classification": {
+                    "critical_point_type": "INFORMATION_LOOKUP",
+                    "classification_reasoning": "stubbed",
+                    "irreversible_action_present": False,
+                    "confidence": "HIGH",
                 },
             },
             "majority_vote_metadata": {},
@@ -174,6 +189,7 @@ class _StubAgent:
             MMRubricResult,
         )
 
+        outcome_block = result.get("outcome_verification") or {}
         rubric_vr = MMRubricResult(
             score=1.0,
             reasoning="stubbed",
@@ -186,12 +202,79 @@ class _StubAgent:
         )
         outcome_vr = MMRubricOutcomeResult(
             score=1.0,
-            reasoning="stubbed",
+            reasoning=outcome_block.get("reasoning", "stubbed"),
             verifier_name="mm_rubric_outcome",
-            output_success=True,
-            primary_intent="stubbed intent",
+            output_success=outcome_block.get("output_success", True),
+            primary_intent=outcome_block.get("primary_intent", "stubbed intent"),
+            cp_type_used=outcome_block.get("cp_type_used"),
+            cp_violation=outcome_block.get("cp_violation"),
         )
         return [rubric_vr, outcome_vr]
+
+
+class _StubVerifierAgent:
+    """Stand-in for ``VerifierAgent`` — Steps 9a / 9b / 10.
+
+    Mirrors the contract documented on ``VerifierAgent.verify`` — takes
+    the rubric + outcome + input dicts and returns the three error-
+    taxonomy buckets. Stubbed values are picked to exercise the score
+    payload (a non-trivial failure_point with an error_code, an
+    ambiguity bool, an invalid bool) so the test can assert each
+    bucket round-trips.
+    """
+
+    async def verify(
+        self,
+        rubric_dict: Dict[str, Any],
+        outcome_dict: Dict[str, Any],
+        input_dict: Dict[str, Any],
+        evidence_by_criterion=None,
+        total_screenshots: int = 0,
+        run_context=None,
+    ) -> Dict[str, Any]:
+        self.last_call = {
+            "rubric_dict": rubric_dict,
+            "outcome_dict": outcome_dict,
+            "input_dict": input_dict,
+        }
+        return {
+            "step9_first_point_of_failure": {
+                "has_failure": True,
+                "first_failure_step": 2,
+                "first_failure_summary": "stubbed: agent missed step 2",
+                "failure_points": [
+                    {
+                        "step_numbers": "2",
+                        "error_code": "3.5",
+                        "error_category": "Execution & Strategy",
+                        "error_type": "Incomplete task execution",
+                        "severity": "high",
+                        "description": "stubbed",
+                    }
+                ],
+                "reasoning": "stubbed",
+            },
+            "step9b_task_verification_with_trajectory": {
+                "is_ambiguous": True,
+                "ambiguity_codes": ["7.1"],
+                "reasoning_is_ambiguous": "stubbed",
+                "is_invalid": False,
+                "invalid_task_codes": [],
+                "reasoning_is_invalid": "stubbed",
+            },
+            "step10_task_verification": {
+                "is_ambiguous": False,
+                "ambiguity_codes": [],
+                "reasoning_is_ambiguous": "stubbed",
+                "is_invalid": False,
+                "invalid_task_codes": [],
+                "reasoning_is_invalid": "stubbed",
+            },
+        }
+
+
+# Back-compat alias — older tests may import _StubAgent directly.
+_StubAgent = _StubMMRubricAgent
 
 
 def test_run_one_end_to_end_with_stubbed_agent(tmp_path: Path, verify_mod):
@@ -208,8 +291,10 @@ def test_run_one_end_to_end_with_stubbed_agent(tmp_path: Path, verify_mod):
     traj_dir = tmp_path / EXAMPLE_TASK_ID
     shutil.copytree(EXAMPLE_TRAJECTORY_DIR, traj_dir)
 
-    stub = _StubAgent()
+    stub = _StubMMRubricAgent()
+    verifier_stub = _StubVerifierAgent()
     verify_mod._GLOBAL_AGENT = stub
+    verify_mod._GLOBAL_VERIFIER = verifier_stub
     verify_mod._GLOBAL_TASKS = {
         EXAMPLE_TASK_ID: {
             "id": EXAMPLE_TASK_ID,
@@ -237,6 +322,14 @@ def test_run_one_end_to_end_with_stubbed_agent(tmp_path: Path, verify_mod):
     assert out["rubric_is_success"] is True
     assert out["outcome_success"] is True
     assert out["n_actions"] == 4
+    # Step 9a values from _StubVerifierAgent surface in the report row.
+    assert out["has_failure"] is True
+    assert out["first_failure_step"] == 2
+    # Step 9b values surface here (Step 10 was 'unambiguous, valid' so
+    # the report row defers to Step 9b).
+    assert out["is_ambiguous"] is True
+    assert out["ambiguity_codes"] == ["7.1"]
+    assert out["is_invalid"] is False
 
     # Score file is written under scores/mmrubric_*.json with the naming
     # convention the dashboard / post_eval_analysis expects.
@@ -249,7 +342,41 @@ def test_run_one_end_to_end_with_stubbed_agent(tmp_path: Path, verify_mod):
     assert gpt_payload["outcome_success"] is True
     assert gpt_payload["rubric_is_success"] == 1
     assert gpt_payload["success_criterion"] == "outcome"
+
+    # --- New CP-aware fields lifted onto the score payload ----------------
+    assert gpt_payload["cp_type_used"] == "INFORMATION_LOOKUP"
+    assert gpt_payload["cp_violation"] is False
+
+    # --- Error-taxonomy bucket round-trips Steps 9a/9b/10 -----------------
     assert "error_taxonomy" in gpt_payload
+    et = gpt_payload["error_taxonomy"]
+    # Step 9a — points of failure, including the new error_code taxonomy
+    fpof = et["first_point_of_failure"]
+    assert fpof is not None
+    assert fpof["has_failure"] is True
+    assert fpof["first_failure_step"] == 2
+    assert isinstance(fpof["failure_points"], list) and fpof["failure_points"]
+    fp0 = fpof["failure_points"][0]
+    assert fp0["error_code"] == "3.5"
+    assert fp0["error_category"] == "Execution & Strategy"
+    # Step 9b — trajectory-informed task verification
+    step9b = et["task_verification_with_trajectory"]
+    assert step9b is not None
+    assert step9b["is_ambiguous"] is True
+    assert step9b["ambiguity_codes"] == ["7.1"]
+    assert step9b["is_invalid"] is False
+    # Step 10 — unified task verification (task + URL only)
+    step10 = et["task_verification"]
+    assert step10 is not None
+    assert step10["is_ambiguous"] is False
+    assert step10["is_invalid"] is False
+
+    # The verifier received the rubric + outcome from MMRubricAgent —
+    # confirming the new composition path actually executes.
+    vc = verifier_stub.last_call
+    assert vc["outcome_dict"]["cp_type_used"] == "INFORMATION_LOOKUP"
+    assert vc["rubric_dict"]["total_max_points"] == 1
+    assert vc["input_dict"]["task"].startswith("Identify the best waterfalls")
 
     # The stub captured the input dict the real agent would have seen —
     # this is the contract the verifier relies on.
@@ -271,7 +398,8 @@ def test_run_one_reports_no_task_data(tmp_path: Path, verify_mod):
     traj_dir = tmp_path / EXAMPLE_TASK_ID
     shutil.copytree(EXAMPLE_TRAJECTORY_DIR, traj_dir)
 
-    verify_mod._GLOBAL_AGENT = _StubAgent()
+    verify_mod._GLOBAL_AGENT = _StubMMRubricAgent()
+    verify_mod._GLOBAL_VERIFIER = _StubVerifierAgent()
     verify_mod._GLOBAL_TASKS = {}  # empty
     verify_mod._GLOBAL_ARGS = {
         "rubric_threshold": 0.8,
@@ -389,3 +517,61 @@ def test_verify_trajectories_live_llm(tmp_path: Path, verify_mod):
     assert score_path.exists()
     payload = json.loads(score_path.read_text())
     assert payload["score"] in (0, 1)  # hard gate: score file parseable
+
+    # The whole point of this enhanced fixture is to make sure the
+    # new CP-aware verifier + error taxonomy reach the score file
+    # end-to-end. We only check structural presence here — the live
+    # LLM's verdict on what value to emit is non-deterministic.
+    gpt_payload = json.loads(payload["gpt_response_text"])
+    # New CP-classification outcome fields (Step 8 enrichment).
+    assert "cp_type_used" in gpt_payload, gpt_payload
+    assert "cp_violation" in gpt_payload, gpt_payload
+    # Steps 9a / 9b / 10 (populated by VerifierAgent inside _run_one).
+    assert "error_taxonomy" in gpt_payload
+    et = gpt_payload["error_taxonomy"]
+    fpof = et.get("first_point_of_failure") or {}
+    # Step 9a must emit the new failure_points list (may be empty for a
+    # successful trajectory, but the key must exist).
+    assert "failure_points" in fpof, f"missing failure_points in {fpof}"
+    for fp in fpof.get("failure_points", []) or []:
+        # The new error taxonomy assigns a numeric code like "3.5" to
+        # every failure point — verify the schema.
+        assert "error_code" in fp, fp
+    # Step 9b — trajectory-informed task verification.
+    step9b = et.get("task_verification_with_trajectory") or {}
+    assert "is_ambiguous" in step9b
+    assert "is_invalid" in step9b
+    # Step 10 — task + URL only (no trajectory).
+    step10 = et.get("task_verification") or {}
+    assert "is_ambiguous" in step10
+    assert "is_invalid" in step10
+
+
+# ---------------------------------------------------------------------------
+# Error-taxonomy loader smoke test — no LLM, pure parsing of the .md.
+# ---------------------------------------------------------------------------
+
+def test_error_taxonomy_loader_parses_categories():
+    """The error-taxonomy loader must produce a non-empty taxonomy
+    block plus the summary table the failure-point prompt expects, and
+    must be able to resolve a known sub-code (3.5 — Incomplete task
+    execution) to its name + description."""
+    from webeval.rubric_agent.error_taxonomy_loader import (
+        extract_subcategory,
+        get_taxonomy_for_failure_prompt,
+    )
+
+    taxonomy_block, summary_table = get_taxonomy_for_failure_prompt()
+    assert taxonomy_block.strip(), "failure-prompt taxonomy block is empty"
+    assert summary_table.strip(), "failure-prompt summary table is empty"
+    # Category 3 (Execution & Strategy) must be in the taxonomy text.
+    assert "Execution" in taxonomy_block or "3." in taxonomy_block
+
+    info = extract_subcategory("3.5")
+    assert info is not None, "3.5 (Incomplete task execution) must be defined"
+    # The loader returns a tuple/dict with at least a name field.
+    if isinstance(info, dict):
+        rendered = " ".join(str(v) for v in info.values())
+    else:
+        rendered = " ".join(str(v) for v in info) if isinstance(info, (list, tuple)) else str(info)
+    assert "Incomplete" in rendered or "incomplete" in rendered, info

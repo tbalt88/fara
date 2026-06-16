@@ -48,6 +48,7 @@ class GracefulRetryClient(ChatCompletionClient):
         max_retries: int = 8,
         max_tokens: int = 115000,
         timeout: Optional[float] = None,
+        max_total_attempts: Optional[int] = None,
     ):
         super().__init__(max_tokens=max_tokens)
         if not clients:
@@ -57,6 +58,13 @@ class GracefulRetryClient(ChatCompletionClient):
         self.max_retries = max_retries
         self.max_tokens = max_tokens
         self.timeout = timeout
+        # Hard ceiling on total loop iterations per create() call so the
+        # loop always terminates even when branches don't consume `tries`.
+        self.max_total_attempts = (
+            max_total_attempts
+            if max_total_attempts is not None
+            else max_retries + 2 * len(clients)
+        )
         self.support_json = support_json
         self.blocklist: set = set()
         self._client_idx = random.randint(0, len(clients) - 1)
@@ -177,12 +185,14 @@ class GracefulRetryClient(ChatCompletionClient):
         extra_create_args: Mapping[str, Any] = {},
     ) -> CreateResult:
         tries = self.max_retries
+        total_attempts = 0
         last_error: Optional[Exception] = None
         client = self.next_client(no_increment=True)
         # Mutable copy so we can mutate per-request without affecting callers.
         extra = dict(extra_create_args)
 
-        while tries > 0:
+        while tries > 0 and total_attempts < self.max_total_attempts:
+            total_attempts += 1
             request_tokens = client.count_tokens(messages=messages)
             self._remove_reasoning_effort_if_needed(client, extra)
             self.logger.info(
@@ -222,6 +232,10 @@ class GracefulRetryClient(ChatCompletionClient):
                 continue
             except openai.BadRequestError as e:
                 if "check-access-response-enc" in str(e):
+                    # Consume the retry budget so a persistent access-token
+                    # failure on a small pool can't loop forever.
+                    tries -= 1
+                    last_error = e
                     self.logger.error(
                         f"GracefulRetryClient.create() AccessTokenError: {client.description}, refreshing credentials\n{e}"
                     )
@@ -298,12 +312,17 @@ class GracefulRetryClient(ChatCompletionClient):
                 await asyncio.sleep(1)
                 continue
             except openai.AuthenticationError as e:
+                # Consume the retry budget so a persistent auth failure on a
+                # single-endpoint pool can't loop forever.
+                tries -= 1
+                last_error = e
                 self.logger.error(
                     f"GracefulRetryClient.create() AuthenticationError: {client.description}: {e}"
                 )
                 if hasattr(client, "refresh_credentials"):
                     client.refresh_credentials()
                 client = self.next_client()
+                await asyncio.sleep(1)
                 continue
             except openai.APIStatusError as e:
                 if "Prompt is too large" in str(e):
@@ -346,7 +365,8 @@ class GracefulRetryClient(ChatCompletionClient):
             raise last_error
         valid_clients = [c for c in self._clients if c.endpoint not in self.blocklist]
         raise Exception(
-            f"GracefulRetryClient.create(): all clients exhausted after {self.max_retries} retries; "
+            f"GracefulRetryClient.create(): gave up after {total_attempts} attempts "
+            f"(max_retries={self.max_retries}, max_total_attempts={self.max_total_attempts}); "
             f"{len(valid_clients)}/{len(self._clients)} clients reachable. Blocklist size: {len(self.blocklist)}"
         )
 
